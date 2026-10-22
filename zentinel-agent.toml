@@ -6,7 +6,7 @@ name = "zentinel-agent-ratelimit"
 version = "0.1.0"
 description = "Token bucket rate limiting agent for Zentinel reverse proxy"
 authors = ["Zentinel Contributors"]
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/zentinelproxy/zentinel-agent-ratelimit"
 
 [protocol]
