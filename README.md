@@ -80,9 +80,9 @@ default) and `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`,
 Limiters are kept in memory per agent process; idle ones are dropped after
 five minutes.
 
-Known limits: `burst` is read but not applied (the bucket size equals
-`requests-per-second`), and a limiter is keyed by the key value alone, so two
-rules that produce the same key share the limiter created first.
+Known limit: `burst` is read but not applied (the bucket size equals
+`requests-per-second`). Each rule has its own limiters, so two rules that
+produce the same key value no longer share one.
 
 ## Install
 
@@ -163,8 +163,50 @@ rules:
 dry-run: false
 ```
 
-The proxy does not forward an agent block's `config { }` to the agent, so
-configure it with the flags and file above.
+Unknown keys are rejected, in the file and in a `config { }` block, and a
+`requests-per-second` of 0 is an error rather than a silent 100.
+
+### Settings from the proxy (`config { }`)
+
+Zentinel (from the release after 0.6.50) sends the agent block's `config { }`
+to the agent on every connection: once per pooled connection at startup and
+again on every reconnect. The agent applies it by one rule:
+
+- **Idempotent.** The block's canonical JSON is hashed; a block identical to
+  the one already applied is a no-op, so reconnects never refill anyone's
+  bucket. When the block does change, limiters are kept for every rule whose
+  settings are unchanged and dropped only for rules that changed or went away.
+- **Merge, don't replace.** The block overlays the settings the agent was
+  started with (the flags, or the `--config` file); a field the block leaves
+  out keeps that value, and a nested block (`default { burst 50 }`) overlays
+  field by field. A `rules` block replaces the rule list as a whole.
+- **Strict.** An unknown or misspelled key, a `requests-per-second` of 0 or a
+  malformed value rejects the configure (the proxy then drops that connection)
+  and the agent keeps its current settings.
+- **Logs** carry the block's hash and the names of the settings that changed,
+  never the block itself.
+
+In KDL, rules are a block keyed by rule name (tried in name order; use the
+YAML file when the order matters); `conditions` holds one or more conditions:
+
+```kdl
+agent "ratelimit" type="rate_limit" {
+    unix-socket "/var/run/zentinel/ratelimit.sock"
+    events "request_headers"
+    config {
+        dry-run #false
+        default { requests-per-second 100; burst 200 }
+        rules {
+            uploads {
+                key "client_ip"
+                requests-per-second 10
+                burst 10
+                conditions { path-prefix "/api/v1/upload"; method "POST" }
+            }
+        }
+    }
+}
+```
 
 ## Development
 
