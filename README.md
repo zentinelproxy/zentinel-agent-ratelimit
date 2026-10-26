@@ -86,11 +86,9 @@ produce the same key value no longer share one.
 
 ## Install
 
-```bash
-zentinel bundle install ratelimit
-```
-
-Or from the repository (the crate is not on crates.io):
+Zentinel 26.10_8 retired this agent from the bundle: `zentinel bundle install
+ratelimit` says so instead of installing it (binaries up to 0.6.50 still
+install it). From the repository (the crate is not on crates.io):
 
 ```bash
 cargo install --git https://github.com/zentinelproxy/zentinel-agent-ratelimit
@@ -168,9 +166,11 @@ Unknown keys are rejected, in the file and in a `config { }` block, and a
 
 ### Settings from the proxy (`config { }`)
 
-Zentinel (from the release after 0.6.50) sends the agent block's `config { }`
-to the agent on every connection: once per pooled connection at startup and
-again on every reconnect. The agent applies it by one rule:
+Zentinel 26.10_8 and later send the agent block's `config { }` to the agent
+on every connection: once per pooled connection at startup and again on every
+reconnect (releases up to 0.6.50 never did; over gRPC only a build against
+`zentinel-agent-protocol` 0.6.51 or later receives it). The agent applies it
+by one rule:
 
 - **Idempotent.** The block's canonical JSON is hashed; a block identical to
   the one already applied is a no-op, so reconnects never refill anyone's
@@ -181,7 +181,8 @@ again on every reconnect. The agent applies it by one rule:
   out keeps that value, and a nested block (`default { burst 50 }`) overlays
   field by field. A `rules` block replaces the rule list as a whole.
 - **Strict.** An unknown or misspelled key, a `requests-per-second` of 0 or a
-  malformed value rejects the configure (the proxy then drops that connection)
+  malformed value rejects the configure (the proxy then drops that connection,
+  retries, and meanwhile the agent's filters follow their `failure-mode`)
   and the agent keeps its current settings.
 - **Logs** carry the block's hash and the names of the settings that changed,
   never the block itself.
