@@ -58,7 +58,7 @@ routes {
 | This agent | Built-in `rate-limit` filter |
 |---|---|
 | `requests-per-second` | `max-rps` |
-| `burst` (parsed, not applied) | `burst` |
+| `burst` | `burst` |
 | `key: client_ip` | `key "client-ip"` |
 | `key: path` | `key "path"` |
 | `key: global` | `key "route"` |
@@ -77,11 +77,11 @@ per-key limiter. Over the limit, it blocks with the rule's status (429 by
 default) and `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`,
 `X-RateLimit-Reset` and `Retry-After: 1`. Allowed requests are forwarded with
 `X-RateLimit-Rule` and `X-RateLimit-Key` added to the upstream request.
-Limiters are kept in memory per agent process; idle ones are dropped after
-five minutes.
+Limiters are kept in memory per agent process; a limiter not used for five
+minutes is dropped.
 
-Known limit: `burst` is read but not applied (the bucket size equals
-`requests-per-second`). Each rule has its own limiters, so two rules that
+Each key's bucket holds `burst` requests (`requests-per-second` when `burst`
+is 0) and refills at `requests-per-second`. Each rule has its own limiters, so two rules that
 produce the same key value no longer share one.
 
 ## Install
@@ -130,7 +130,7 @@ Attach it to a route with `filters "ratelimit"`.
 | `--grpc-address` / `RATELIMIT_AGENT_GRPC_ADDRESS` | none | Listen on gRPC (e.g. `0.0.0.0:50051`) instead of the socket |
 | `--config`, `-c` / `RATELIMIT_AGENT_CONFIG` | none | YAML rules file; without it, one client-IP rule from the flags below |
 | `--default-rps` / `RATELIMIT_AGENT_DEFAULT_RPS` | `100` | Requests per second of the default rule (no `--config`) |
-| `--default-burst` / `RATELIMIT_AGENT_DEFAULT_BURST` | `200` | Burst of the default rule (not applied, see above) |
+| `--default-burst` / `RATELIMIT_AGENT_DEFAULT_BURST` | `200` | Burst (bucket size) of the default rule |
 | `--dry-run` / `RATELIMIT_AGENT_DRY_RUN` | `false` | Log instead of blocking (no `--config`; with a file, use its `dry-run`) |
 | `--cleanup-interval` / `RATELIMIT_AGENT_CLEANUP_INTERVAL` | `60` | Seconds between sweeps of idle limiters |
 | `--log-level`, `-l` / `RATELIMIT_AGENT_LOG_LEVEL` | `info` | Log level (`RUST_LOG` takes precedence) |

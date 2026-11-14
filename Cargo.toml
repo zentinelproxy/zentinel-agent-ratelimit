@@ -68,4 +68,5 @@ config = "0.14"
 
 [dev-dependencies]
 tempfile = "3.12"
+tokio = { version = "1.40", features = ["test-util"] }
 criterion = "0.5"
