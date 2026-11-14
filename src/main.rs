@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use clap::Parser;
 use dashmap::DashMap;
 use governor::{
-    clock::DefaultClock,
+    clock::Clock,
+    middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
@@ -31,7 +32,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use zentinel_agent_protocol::v2::{
@@ -250,11 +251,66 @@ impl RateLimitConfig {
     }
 }
 
+/// The agent's clock: time elapsed since the agent started.
+///
+/// Built on `tokio::time::Instant`, so the limiters and the idle-limiter
+/// cleanup share one notion of time, and tests can drive both with tokio's
+/// paused clock instead of waiting in real time.
+#[derive(Debug, Clone, Copy)]
+struct AgentClock {
+    start: tokio::time::Instant,
+}
+
+impl AgentClock {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Clock for AgentClock {
+    type Instant = Duration;
+
+    fn now(&self) -> Duration {
+        tokio::time::Instant::now().duration_since(self.start)
+    }
+}
+
+type Limiter = RateLimiter<NotKeyed, InMemoryState, AgentClock, NoOpMiddleware<Duration>>;
+
 /// Rate limiter entry
 struct RateLimiterEntry {
-    limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    last_used: Instant,
+    limiter: Arc<Limiter>,
+    /// When the limiter was last checked, in nanoseconds of [`AgentClock`].
+    /// Updated on every check, so only idle limiters are cleaned up.
+    last_used_nanos: AtomicU64,
     rule_name: String,
+}
+
+impl RateLimiterEntry {
+    fn touch(&self, now: Duration) {
+        self.last_used_nanos
+            .fetch_max(duration_nanos(now), Ordering::Relaxed);
+    }
+
+    fn idle_for(&self, now: Duration) -> Duration {
+        Duration::from_nanos(
+            duration_nanos(now).saturating_sub(self.last_used_nanos.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+fn duration_nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The limiter's quota: `requests-per-second` tokens refill per second, and
+/// the bucket holds `burst` of them (`requests-per-second` when `burst` is 0).
+fn rule_quota(rule: &RateLimitRule) -> Quota {
+    let rate = NonZeroU32::new(rule.requests_per_second).unwrap_or(nonzero!(100u32));
+    let burst = NonZeroU32::new(rule.burst).unwrap_or(rate);
+    Quota::per_second(rate).allow_burst(burst)
 }
 
 /// Rate limit agent implementation
@@ -281,6 +337,8 @@ struct RateLimitAgent {
     metrics: Arc<RateLimitMetrics>,
     /// Draining flag
     draining: Arc<RwLock<bool>>,
+    /// Clock for the limiters and their last-used times
+    clock: AgentClock,
 }
 
 /// Rate limit metrics
@@ -312,6 +370,7 @@ impl RateLimitAgent {
                 active_limiters: std::sync::atomic::AtomicUsize::new(0),
             }),
             draining: Arc::new(RwLock::new(false)),
+            clock: AgentClock::new(),
         }
     }
 
@@ -380,58 +439,44 @@ impl RateLimitAgent {
     }
 
     /// Get or create rate limiter
-    fn get_or_create_limiter(
-        &self,
-        key: String,
-        rule: &RateLimitRule,
-    ) -> Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
+    fn get_or_create_limiter(&self, key: String, rule: &RateLimitRule) -> Arc<Limiter> {
         // Keyed by rule as well, so rules never share a limiter and a changed
         // rule's limiters can be dropped on their own.
         let key = format!("{}\u{0}{}", rule.name, key);
+        let now = self.clock.now();
         if let Some(entry) = self.limiters.get(&key) {
-            entry.limiter.clone()
-        } else {
-            // Create new limiter
-            let quota = Quota::per_second(
-                NonZeroU32::new(rule.requests_per_second).unwrap_or(nonzero!(100u32)),
-            );
-
-            let limiter = Arc::new(RateLimiter::direct_with_clock(
-                quota,
-                &DefaultClock::default(),
-            ));
-
-            let entry = RateLimiterEntry {
-                limiter: limiter.clone(),
-                last_used: Instant::now(),
-                rule_name: rule.name.clone(),
-            };
-
-            self.limiters.insert(key, entry);
-            self.metrics.active_limiters.fetch_add(1, Ordering::Relaxed);
-
-            limiter
+            entry.touch(now);
+            return entry.limiter.clone();
         }
+        // Through the entry API, so two requests creating the same limiter
+        // at once end up sharing one.
+        let entry = self.limiters.entry(key).or_insert_with(|| {
+            self.metrics.active_limiters.fetch_add(1, Ordering::Relaxed);
+            RateLimiterEntry {
+                limiter: Arc::new(RateLimiter::direct_with_clock(
+                    rule_quota(rule),
+                    &self.clock,
+                )),
+                last_used_nanos: AtomicU64::new(duration_nanos(now)),
+                rule_name: rule.name.clone(),
+            }
+        });
+        entry.touch(now);
+        entry.limiter.clone()
     }
 
     /// Clean up expired limiters
     async fn cleanup_expired_limiters(&self, max_age: Duration) {
-        let now = Instant::now();
-        let mut expired = Vec::new();
-
-        // Find expired entries
-        for entry in self.limiters.iter() {
-            if now.duration_since(entry.last_used) > max_age {
-                expired.push(entry.key().clone());
-            }
-        }
-
-        // Remove expired entries
-        let expired_count = expired.len();
-        for key in expired {
-            self.limiters.remove(&key);
-            self.metrics.active_limiters.fetch_sub(1, Ordering::Relaxed);
-        }
+        let now = self.clock.now();
+        let before = self.limiters.len();
+        // Checked under the shard lock, so a limiter used while the cleanup
+        // runs is kept.
+        self.limiters
+            .retain(|_, entry| entry.idle_for(now) <= max_age);
+        let expired_count = before.saturating_sub(self.limiters.len());
+        self.metrics
+            .active_limiters
+            .store(self.limiters.len(), Ordering::Relaxed);
 
         debug!("Cleaned up {} expired rate limiters", expired_count);
     }
@@ -1158,5 +1203,98 @@ mod tests {
         assert!(config.rules[0]
             .conditions
             .contains(&MatchCondition::Method(vec!["POST".into()])));
+    }
+
+    /// The idle-limiter cleanup as `main` runs it.
+    const CLEANUP_MAX_AGE: Duration = Duration::from_secs(300);
+
+    /// Regression for #7: a limiter that is used every second must survive
+    /// the idle cleanup and keep its state. Before the fix `last_used` was set
+    /// when the limiter was created and never again, so the cleanup dropped
+    /// even a busy limiter after five minutes and the client got a fresh,
+    /// full bucket.
+    #[tokio::test(start_paused = true)]
+    async fn busy_limiter_survives_cleanup_and_stays_at_its_limit() {
+        let rps = 10u32;
+        let agent = cli_agent(rps);
+        let started = tokio::time::Instant::now();
+        let mut allowed = 0u64;
+        let mut last_request = started;
+        let mut first_limiter = None;
+
+        // Ten minutes: twice the cleanup age. Every second the client sends
+        // more than its limit, then runs into the cleanup and tries again
+        // 100 ms later (when a correct bucket has refilled one token).
+        for _ in 0..600 {
+            for _ in 0..(rps + 1) {
+                if !blocked(&agent, "/").await {
+                    allowed += 1;
+                }
+            }
+            let limiter = agent.limiters.iter().next().unwrap().limiter.clone();
+            let first = first_limiter.get_or_insert_with(|| limiter.clone());
+            assert!(
+                Arc::ptr_eq(first, &limiter),
+                "the busy limiter was dropped and recreated after {:?}",
+                started.elapsed()
+            );
+
+            tokio::time::advance(Duration::from_millis(100)).await;
+            agent.cleanup_expired_limiters(CLEANUP_MAX_AGE).await;
+            for _ in 0..(rps + 1) {
+                if !blocked(&agent, "/").await {
+                    allowed += 1;
+                }
+            }
+            last_request = tokio::time::Instant::now();
+            tokio::time::advance(Duration::from_millis(900)).await;
+            agent.cleanup_expired_limiters(CLEANUP_MAX_AGE).await;
+        }
+
+        assert_eq!(agent.limiters.len(), 1);
+        // GCRA with `burst` tokens refilling at `rps` per second allows at
+        // most `burst + rps * elapsed` requests.
+        let elapsed_ms = last_request.duration_since(started).as_millis() as u64;
+        let ceiling = u64::from(rps) + elapsed_ms * u64::from(rps) / 1000;
+        assert!(
+            allowed <= ceiling,
+            "allowed {allowed} requests in {elapsed_ms} ms, limit allows {ceiling}"
+        );
+    }
+
+    /// An idle limiter is still dropped once it has not been used for the
+    /// cleanup age.
+    #[tokio::test(start_paused = true)]
+    async fn idle_limiter_is_dropped_by_cleanup() {
+        let agent = cli_agent(10);
+        assert!(!blocked(&agent, "/").await);
+        tokio::time::advance(Duration::from_secs(200)).await;
+        assert!(!blocked(&agent, "/").await);
+        tokio::time::advance(Duration::from_secs(200)).await;
+        agent.cleanup_expired_limiters(CLEANUP_MAX_AGE).await;
+        assert_eq!(agent.limiters.len(), 1, "used 200 s ago, not idle yet");
+        tokio::time::advance(Duration::from_secs(101)).await;
+        agent.cleanup_expired_limiters(CLEANUP_MAX_AGE).await;
+        assert_eq!(agent.limiters.len(), 0, "idle for 301 s");
+    }
+
+    /// Regression for #7: `burst` was parsed but the bucket held only
+    /// `requests-per-second` tokens.
+    #[tokio::test(start_paused = true)]
+    async fn burst_is_applied() {
+        let mut config = RateLimitConfig::default();
+        config.default.requests_per_second = 1;
+        config.default.burst = 5;
+        let agent = RateLimitAgent::new(config);
+        for i in 0..5 {
+            assert!(
+                !blocked(&agent, "/").await,
+                "request {i} is within the burst"
+            );
+        }
+        assert!(blocked(&agent, "/").await, "the burst is used up");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!blocked(&agent, "/").await, "one token refills per second");
+        assert!(blocked(&agent, "/").await);
     }
 }
